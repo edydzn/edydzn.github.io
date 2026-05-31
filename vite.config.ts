@@ -51,12 +51,28 @@ export default defineConfig({
     },
   },
   build: {
+    outDir: 'dist',
+    emptyOutDir: true,
+    sourcemap: false,
     rollupOptions: {
       // Supabase Edge Functions run on Deno; exclude them from the frontend bundle.
       external: [/^npm:/, /^jsr:/],
+      output: {
+        manualChunks: {
+          'react-vendor': ['react', 'react-dom'],
+          'mui-vendor': ['@mui/material', '@mui/icons-material'],
+          'radix-vendor': ['@radix-ui/react-dialog', '@radix-ui/react-dropdown-menu'],
+        },
+      },
     },
   },
   optimizeDeps: {
     exclude: ['supabase/functions/server'],
+  },
+  server: {
+    port: 3000,
+  },
+  preview: {
+    port: 8000,
   },
 })
