@@ -2952,5 +2952,282 @@ app.get("/make-server-bdae3ab6/store/user/downloads", async (c) => {
   }
 });
 
+// ===== ADMIN ENDPOINTS =====
+
+// GET /admin/users - Lista todos os usuários com status de assinatura
+app.get("/make-server-bdae3ab6/admin/users", async (c) => {
+  try {
+    const admin = adminClient();
+    
+    // Buscar todos os usuários do Supabase Auth
+    const { data: authUsers, error: authError } = await admin.auth.admin.listUsers();
+    if (authError) throw authError;
+
+    // Buscar dados de assinatura do KV Store
+    const userKeys = authUsers.users.map(u => `user:${u.id}`);
+    const usersData = await Promise.all(
+      userKeys.map(key => kv.get(key).catch(() => null))
+    );
+
+    const users = authUsers.users.map((authUser, i) => {
+      const userData = usersData[i] || {};
+      const expiresAt = userData.subscriptionExpiresAt;
+      const isActive = userData.subscriptionStatus === 'active' && 
+                      (!expiresAt || expiresAt > Date.now());
+      
+      return {
+        userId: authUser.id,
+        email: authUser.email,
+        name: userData.name || authUser.user_metadata?.name || '—',
+        subscriptionStatus: isActive ? 'active' : 'inactive',
+        subscriptionExpiresAt: expiresAt || null,
+        subscriptionMethod: userData.subscriptionMethod || null,
+        downloadsToday: userData.downloadsToday || 0,
+        totalDownloads: userData.totalDownloads || 0,
+        createdAt: authUser.created_at,
+        lastSignInAt: authUser.last_sign_in_at,
+      };
+    });
+
+    return c.json({ success: true, users });
+  } catch (error) {
+    console.error('[Admin Users] Error:', error);
+    return c.json({ success: false, error: error.message }, 500);
+  }
+});
+
+// GET /admin/stats - Retorna estatísticas do dashboard
+app.get("/make-server-bdae3ab6/admin/stats", async (c) => {
+  try {
+    const admin = adminClient();
+
+    // Buscar todos os usuários
+    const { data: authUsers, error: authError } = await admin.auth.admin.listUsers();
+    if (authError) throw authError;
+
+    // Buscar dados do KV Store
+    const allUserData = await kv.getByPrefix("user:");
+    const allTransactions = await kv.getByPrefix("transaction:");
+    const allItems = await kv.getByPrefix("item:");
+
+    // Calcular estatísticas
+    const now = Date.now();
+    let activeSubscriptions = 0;
+    let expiringSoon = 0;
+    let totalDownloads = 0;
+    let downloadsLast7 = 0;
+
+    allUserData.forEach((userData: any) => {
+      if (userData?.subscriptionStatus === 'active') {
+        if (!userData.subscriptionExpiresAt || userData.subscriptionExpiresAt > now) {
+          activeSubscriptions++;
+          if (userData.subscriptionExpiresAt && 
+              userData.subscriptionExpiresAt - now < 7 * 24 * 60 * 60 * 1000) {
+            expiringSoon++;
+          }
+        }
+      }
+      totalDownloads += userData?.totalDownloads || 0;
+    });
+
+    // Downloads últimos 7 dias
+    const sevenDaysAgo = now - (7 * 24 * 60 * 60 * 1000);
+    allUserData.forEach((userData: any) => {
+      if (userData?.lastDownloadDate) {
+        const lastDownloadTime = new Date(userData.lastDownloadDate).getTime();
+        if (lastDownloadTime > sevenDaysAgo) {
+          downloadsLast7 += userData.downloadsToday || 0;
+        }
+      }
+    });
+
+    // Transações aprovadas
+    let approvedPayments = 0;
+    let revenue = 0;
+    allTransactions.forEach((tx: any) => {
+      if (tx?.status === 'approved') {
+        approvedPayments++;
+        revenue += tx?.amount || 0;
+      }
+    });
+
+    // Top 5 itens mais baixados
+    const topItems = allItems
+      .sort((a: any, b: any) => (b?.downloadCount || 0) - (a?.downloadCount || 0))
+      .slice(0, 5)
+      .map((item: any) => ({
+        title: item?.title || 'Sem título',
+        count: item?.downloadCount || 0,
+      }));
+
+    return c.json({
+      success: true,
+      stats: {
+        totalUsers: authUsers.users.length,
+        activeSubscriptions,
+        expiringSoon,
+        totalItems: allItems.length,
+        totalDownloads,
+        downloadsLast7,
+        approvedPayments,
+        revenue,
+        topItems,
+      },
+    });
+  } catch (error) {
+    console.error('[Admin Stats] Error:', error);
+    return c.json({ success: false, error: error.message }, 500);
+  }
+});
+
+// GET /admin/payments - Lista todas as transações
+app.get("/make-server-bdae3ab6/admin/payments", async (c) => {
+  try {
+    const allTransactions = await kv.getByPrefix("transaction:");
+    
+    const payments = allTransactions.map((tx: any) => ({
+      id: tx?.id || '—',
+      externalReference: tx?.externalReference || '—',
+      userId: tx?.userId || '—',
+      userEmail: tx?.userEmail || '—',
+      type: tx?.type || '—',
+      amount: tx?.amount || 0,
+      status: tx?.status || 'unknown',
+      createdAt: tx?.createdAt || '—',
+      completedAt: tx?.completedAt || null,
+      metadata: tx?.metadata || {},
+    }));
+
+    return c.json({ success: true, payments });
+  } catch (error) {
+    console.error('[Admin Payments] Error:', error);
+    return c.json({ success: false, error: error.message }, 500);
+  }
+});
+
+// POST /admin/payments/:ref/refresh - Sincroniza status de pagamento com Mercado Pago
+app.post("/make-server-bdae3ab6/admin/payments/:ref/refresh", async (c) => {
+  try {
+    const externalRef = c.req.param('ref');
+    
+    // Buscar transação no KV Store
+    const txKey = `transaction:${externalRef}`;
+    const payment = await kv.get(txKey);
+    
+    if (!payment) {
+      return c.json({ success: false, error: 'Transação não encontrada' }, 404);
+    }
+
+    // Se for Mercado Pago, sincronizar status
+    if (payment.type === 'mercadopago') {
+      const mpAccessToken = Deno.env.get('MERCADOPAGO_ACCESS_TOKEN');
+      
+      try {
+        const response = await fetch(
+          `https://api.mercadopago.com/v1/payments/search?external_reference=${externalRef}`,
+          {
+            headers: { 'Authorization': `Bearer ${mpAccessToken}` },
+          }
+        );
+        
+        if (!response.ok) {
+          throw new Error(`Mercado Pago API error: ${response.status}`);
+        }
+
+        const mpData = await response.json();
+        const mpPayment = mpData.results?.[0];
+
+        if (mpPayment) {
+          payment.status = mpPayment.status;
+          payment.metadata = { ...payment.metadata, mpData };
+          await kv.set(txKey, payment);
+        }
+      } catch (mpError) {
+        console.error('[Mercado Pago Sync] Error:', mpError);
+        return c.json({ 
+          success: false, 
+          error: 'Erro ao sincronizar com Mercado Pago',
+          payment 
+        }, 500);
+      }
+    }
+
+    return c.json({ success: true, payment });
+  } catch (error) {
+    console.error('[Refresh Payment] Error:', error);
+    return c.json({ success: false, error: error.message }, 500);
+  }
+});
+
+// POST /admin/users/:userId/subscription - Ativa/cancela assinatura
+app.post("/make-server-bdae3ab6/admin/users/:userId/subscription", async (c) => {
+  try {
+    const userId = c.req.param('userId');
+    const { status, days = 30, method = 'manual' } = await c.req.json();
+
+    if (!['active', 'inactive'].includes(status)) {
+      return c.json({ success: false, error: 'Status inválido' }, 400);
+    }
+
+    const userKey = `user:${userId}`;
+    const userData = await kv.get(userKey) || {};
+
+    if (status === 'active') {
+      userData.subscriptionStatus = 'active';
+      userData.subscriptionExpiresAt = Date.now() + (days * 24 * 60 * 60 * 1000);
+      userData.subscriptionMethod = method;
+    } else {
+      userData.subscriptionStatus = 'inactive';
+      userData.subscriptionExpiresAt = null;
+    }
+
+    await kv.set(userKey, userData);
+
+    return c.json({ 
+      success: true, 
+      message: `Assinatura ${status === 'active' ? 'ativada' : 'cancelada'}`,
+      user: userData 
+    });
+  } catch (error) {
+    console.error('[Set Subscription] Error:', error);
+    return c.json({ success: false, error: error.message }, 500);
+  }
+});
+
+// PUT /admin/users/:userId - Atualiza dados do usuário
+app.put("/make-server-bdae3ab6/admin/users/:userId", async (c) => {
+  try {
+    const admin = adminClient();
+    const userId = c.req.param('userId');
+    const { name, email, password } = await c.req.json();
+
+    // Atualizar email/senha no Supabase Auth
+    if (email || password) {
+      const updatePayload: any = {};
+      if (email) updatePayload.email = email;
+      if (password) updatePayload.password = password;
+
+      const { error: authError } = await admin.auth.admin.updateUserById(
+        userId,
+        updatePayload
+      );
+
+      if (authError) throw authError;
+    }
+
+    // Atualizar nome no KV Store
+    if (name) {
+      const userKey = `user:${userId}`;
+      const userData = await kv.get(userKey) || {};
+      userData.name = name;
+      await kv.set(userKey, userData);
+    }
+
+    return c.json({ success: true, message: 'Usuário atualizado com sucesso' });
+  } catch (error) {
+    console.error('[Update User] Error:', error);
+    return c.json({ success: false, error: error.message }, 500);
+  }
+});
 
 Deno.serve(app.fetch);
